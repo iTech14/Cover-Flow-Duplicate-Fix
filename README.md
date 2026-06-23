@@ -80,9 +80,10 @@ chasing it that this project did.
 ## What this tool does
 
 ```
-python3 itunesdb_diag.py search  <path_to_iTunesDB> "<album search string>"
-python3 itunesdb_diag.py summary <path_to_iTunesDB>
-python3 itunesdb_diag.py fix     <path_to_iTunesDB> <output_path> "<Album1>" ["<Album2>" ...]
+python3 itunesdb_diag.py search    <path_to_iTunesDB> "<album search string>"
+python3 itunesdb_diag.py summary   <path_to_iTunesDB>
+python3 itunesdb_diag.py playlists <path_to_iTunesDB>
+python3 itunesdb_diag.py fix       <path_to_iTunesDB> <output_path> "<Album1>" ["<Album2>" ...]
 ```
 
 ### `search`
@@ -128,6 +129,22 @@ as untrustworthy, rather than just the bytes that were actually changed.
 **Use `fix` for research/inspection only. Do not rely on it to actually
 fix a real device.** The confirmed, safe, durable fix is described below.
 
+### `playlists` — experimental, raw header inspection
+
+Dumps every playlist's Title, header size, the one field this tool is
+fully confident about (`data_object_child_count`), and a raw hex dump of
+the rest of the playlist's type-specific header.
+
+Several more fields are known, from independent technical sources, to
+exist in that header — a flag that's 1 for the iPod's one "master"
+playlist and 0 for every other playlist, a creation timestamp, and
+possibly more — but this tool does not have one single, cross-confirmed
+byte-offset table for them the way it does for tracks. Rather than guess
+at what a given byte means, `playlists` just shows you the raw bytes so
+you can compare playlists yourself — e.g. a playlist with some special
+purpose against an ordinary user playlist. See the case study below for
+what this actually turned up.
+
 ## The actual fix
 
 1. In your tag editor (or iTunes's own **Get Info → Sorting** tab),
@@ -146,6 +163,31 @@ fix a real device.** The confirmed, safe, durable fix is described below.
    changes that looked applied in the tag editor or in iTunes but had
    silently failed to propagate through to the device on the next sync.
 5. Check Cover Flow on the device.
+
+## Case study: a possible clickwheel-game playlist marker (inconclusive)
+
+While investigating a separate problem — a clickwheel game ("Phase") not
+recognizing a properly-synced custom playlist despite the playlist
+existing on the device with the right name and songs — `playlists` turned
+up something that doesn't appear to be documented anywhere else.
+
+Every ordinary playlist's header follows an identical template: a count, a
+timestamp, an 8-byte ID (consistent with a Persistent ID, the same concept
+tracks have), then a long run of zero bytes, then the timestamp repeated
+once near the end. The playlist that the game-specific `.ipg` import
+process generates breaks that pattern in one specific way: right where
+every ordinary playlist has nothing but zeros, this playlist has a
+distinct 16-byte sequence formatted like a GUID — and the second half of
+that GUID is the exact same 8 bytes as the playlist's own Persistent ID,
+echoed back into a fixed-prefix construction. That's consistent with
+Apple's `.ipg` import process deliberately tagging the playlist as
+"special" in a way ordinary playlists never get.
+
+This is left here because the marker itself is a real, verified,
+previously-undocumented detail of the iTunesDB format that may be useful
+to someone else investigating clickwheel-game/playlist interaction —
+even though it wasn't the answer to the specific problem that led to
+finding it.
 
 ## Getting your `iTunesDB` file
 
