@@ -97,6 +97,66 @@ def make_itunesdb(tracks):
     return full_file
 
 
+def make_mhyp(title, data_object_child_count=1, extra_header_bytes=b''):
+    """Build a single mhyp (playlist) chunk with just a Title mhod child.
+
+    `extra_header_bytes` simulates the partially-understood region of the
+    real mhyp header (master-playlist flag, timestamp, etc.) -- tests use
+    this to confirm the parser reports it back faithfully as a hex dump
+    without claiming to interpret it.
+    """
+    mhod = make_mhod(1, title)
+    header_len = 16 + len(extra_header_bytes)
+    buf = bytearray(header_len)
+    buf[0:4] = b'mhyp'
+    struct.pack_into('<I', buf, 4, header_len)
+    struct.pack_into('<I', buf, 12, data_object_child_count)
+    buf[16:16 + len(extra_header_bytes)] = extra_header_bytes
+    full = bytearray(bytes(buf) + mhod)
+    struct.pack_into('<I', full, 8, len(full))  # total_len
+    return bytes(full)
+
+
+def make_itunesdb_with_playlists(tracks, playlists):
+    """Build a minimal iTunesDB containing both a track list (mhsd holding
+    an mhlt) and a playlist list (mhsd holding an mhlp -> mhyp chunks)."""
+    mhlt_body = b''.join(tracks)
+    mhlt = bytearray(12)
+    mhlt[0:4] = b'mhlt'
+    struct.pack_into('<I', mhlt, 4, 12)
+    struct.pack_into('<I', mhlt, 8, len(tracks))
+    mhlt = bytes(mhlt) + mhlt_body
+
+    mhsd_tracks = bytearray(16)
+    mhsd_tracks[0:4] = b'mhsd'
+    struct.pack_into('<I', mhsd_tracks, 4, 16)
+    struct.pack_into('<I', mhsd_tracks, 12, 1)
+    mhsd_tracks_full = bytearray(bytes(mhsd_tracks) + mhlt)
+    struct.pack_into('<I', mhsd_tracks_full, 8, len(mhsd_tracks_full))
+
+    mhlp_body = b''.join(playlists)
+    mhlp = bytearray(12)
+    mhlp[0:4] = b'mhlp'
+    struct.pack_into('<I', mhlp, 4, 12)
+    struct.pack_into('<I', mhlp, 8, len(playlists))  # documented exception: child COUNT
+    mhlp = bytes(mhlp) + mhlp_body
+
+    mhsd_playlists = bytearray(16)
+    mhsd_playlists[0:4] = b'mhsd'
+    struct.pack_into('<I', mhsd_playlists, 4, 16)
+    struct.pack_into('<I', mhsd_playlists, 12, 2)  # arbitrary; parser checks child tag, not this
+    mhsd_playlists_full = bytearray(bytes(mhsd_playlists) + mhlp)
+    struct.pack_into('<I', mhsd_playlists_full, 8, len(mhsd_playlists_full))
+
+    mhbd = bytearray(244)
+    mhbd[0:4] = b'mhbd'
+    struct.pack_into('<I', mhbd, 4, 244)
+    struct.pack_into('<I', mhbd, 20, 2)  # 2 mhsd children
+    full_file = bytearray(bytes(mhbd) + bytes(mhsd_tracks_full) + bytes(mhsd_playlists_full))
+    struct.pack_into('<I', full_file, 8, len(full_file))
+    return full_file
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -324,6 +384,48 @@ class TestApplyFix(unittest.TestCase):
         results = diag.apply_fix(self.db, by_album, ["Untouched Album"])
         self.assertTrue(results[0]['found'])
         self.assertEqual(results[0]['patches'], [])
+
+
+class TestPlaylistParsing(unittest.TestCase):
+    def test_extracts_playlist_titles_in_order(self):
+        db = make_itunesdb_with_playlists(
+            tracks=[make_mhit("T1", "Album", "Artist", unique_id=1)],
+            playlists=[
+                make_mhyp("Master", extra_header_bytes=b'\x01\x00\x00\x00'),
+                make_mhyp("Phase Music", extra_header_bytes=b'\x00\x00\x00\x00'),
+            ],
+        )
+        playlists = diag.parse_all_playlists(db)
+        self.assertEqual([p['Title'] for p in playlists], ["Master", "Phase Music"])
+
+    def test_unknown_header_hex_reflects_real_bytes_without_interpreting_them(self):
+        db = make_itunesdb_with_playlists(
+            tracks=[make_mhit("T1", "Album", "Artist", unique_id=1)],
+            playlists=[
+                make_mhyp("A", extra_header_bytes=b'\x01\x00'),
+                make_mhyp("B", extra_header_bytes=b'\x00\x00'),
+            ],
+        )
+        playlists = diag.parse_all_playlists(db)
+        self.assertEqual(playlists[0]['unknown_header_hex'], '0100')
+        self.assertEqual(playlists[1]['unknown_header_hex'], '0000')
+        self.assertNotEqual(playlists[0]['unknown_header_hex'], playlists[1]['unknown_header_hex'])
+
+    def test_does_not_confuse_tracks_and_playlists(self):
+        # Make sure walking the playlist section doesn't pick up track data,
+        # and vice versa -- they're parsed by two independent functions.
+        db = make_itunesdb_with_playlists(
+            tracks=[
+                make_mhit("Track One", "Some Album", "Some Artist", unique_id=1),
+                make_mhit("Track Two", "Some Album", "Some Artist", unique_id=2),
+            ],
+            playlists=[make_mhyp("Only Playlist")],
+        )
+        tracks = diag.parse_all_tracks(db)
+        playlists = diag.parse_all_playlists(db)
+        self.assertEqual(len(tracks), 2)
+        self.assertEqual(len(playlists), 1)
+        self.assertEqual(playlists[0]['Title'], "Only Playlist")
 
 
 if __name__ == '__main__':

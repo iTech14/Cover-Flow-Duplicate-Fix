@@ -255,6 +255,108 @@ def parse_mhit(data, offset):
     return info, total_len
 
 
+def parse_mhyp(data, offset):
+    """Parse a single playlist (mhyp) header.
+
+    Returns (info: dict, total_len: int). Only fields with a confirmed
+    byte offset are extracted directly: header_len, total_len, the
+    documented "Data Object Child Count" field, and -- by walking just
+    this playlist's mhod children -- its Title (name).
+
+    Several more fields are known, from multiple independent sources, to
+    exist in the rest of this header (e.g. a flag that's 1 for the iPod's
+    one "master" playlist and 0 for every other playlist, a creation
+    timestamp, and possibly additional unidentified flag bytes tied to
+    special-purpose playlists). Different sources describe this region
+    slightly differently, and this tool does not have one single,
+    cross-confirmed byte offset table for it the way it does for tracks.
+    Rather than guess at field meanings, the unknown region (everything
+    between the Data Object Child Count field and the end of the
+    type-specific header) is returned as a raw hex string in
+    `unknown_header_hex`, for direct comparison between playlists -- e.g.
+    a playlist known to work correctly for some special purpose vs. an
+    ordinary user playlist.
+    """
+    tag, header_len, total_len = read_chunk_header(data, offset)
+    if tag != b'mhyp':
+        raise ITunesDBError(f"Expected mhyp at offset {offset}, got {tag!r}")
+
+    data_object_child_count = struct.unpack_from('<I', data, offset + 12)[0]
+    unknown_header_bytes = bytes(data[offset + 16: offset + header_len])
+
+    title = None
+    pos = offset + header_len
+    end = offset + total_len
+    count = 0
+    while pos < end and count < data_object_child_count:
+        ctag, _cheader_len, ctotal_len = read_chunk_header(data, pos)
+        if ctag != b'mhod':
+            break
+        mhod_type, value, _ = parse_mhod(data, pos)
+        if mhod_type == 1 and value is not None:
+            title = value
+        pos += ctotal_len
+        count += 1
+
+    info = {
+        'offset': offset,
+        'header_len': header_len,
+        'total_len': total_len,
+        'data_object_child_count': data_object_child_count,
+        'unknown_header_hex': unknown_header_bytes.hex(),
+        'Title': title,
+    }
+    return info, total_len
+
+
+def parse_all_playlists(data, log=None):
+    """Walk the full iTunesDB structure and return a list of playlist-info
+    dicts (see parse_mhyp).
+
+    Finds whichever mhsd section holds an mhlp child, rather than
+    assuming a specific mhsd `type` number means "this is the playlists
+    section" -- that mapping wasn't confirmed with the same certainty as
+    the track-list case (mhsd type 1), so this checks the actual child
+    chunk tag instead of trusting a type number.
+    """
+    def _log(msg):
+        if log is not None:
+            log(msg)
+
+    tag, header_len, _ = read_chunk_header(data, 0)
+    if tag != b'mhbd':
+        raise ITunesDBError(
+            f"This doesn't look like an iTunesDB file (expected mhbd, got {tag!r})."
+        )
+
+    num_children = struct.unpack_from('<I', data, 20)[0]
+    pos = header_len
+    all_playlists = []
+
+    for child_i in range(num_children):
+        stag, sheader_len, stotal_len = read_chunk_header(data, pos)
+        if stag != b'mhsd':
+            _log(f"  Warning: expected mhsd at offset {pos}, got {stag!r}. Stopping.")
+            break
+
+        cpos = pos + sheader_len
+        ctag, cheader_len, cfield3 = read_chunk_header(data, cpos)
+        if ctag == b'mhlp':
+            # mhlp is a documented exception to the usual "field3 = total
+            # length" rule: here it's the number of playlist (mhyp) children.
+            num_playlists = cfield3
+            _log(f"  [mhlp] at offset={cpos} num_playlists={num_playlists}")
+            ypos = cpos + cheader_len
+            for _ in range(num_playlists):
+                info, ylen = parse_mhyp(data, ypos)
+                all_playlists.append(info)
+                ypos += ylen
+
+        pos += stotal_len
+
+    return all_playlists
+
+
 def parse_all_tracks(data, log=None):
     """Walk the full iTunesDB structure and return a list of track-info dicts.
 
@@ -450,6 +552,31 @@ def _load(path):
         return bytearray(f.read())
 
 
+def cmd_playlists(args):
+    print("=" * 80)
+    print("NOTE: this dumps RAW, mostly-uninterpreted playlist header bytes.")
+    print("Several fields in this header are known to exist (from multiple")
+    print("independent sources) but aren't byte-offset-confirmed by this tool,")
+    print("so the 'unknown_header_hex' field is intentionally just a hex dump")
+    print("-- compare it between playlists yourself rather than trusting any")
+    print("single byte's meaning. See the README for context.")
+    print("=" * 80)
+    print()
+
+    data = _load(args.itunesdb)
+    playlists = parse_all_playlists(data, log=print)
+
+    print(f"\n=== Found {len(playlists)} playlist(s) ===\n")
+    for p in playlists:
+        print('-' * 80)
+        print(f"  Title              : {p.get('Title')}")
+        print(f"  header_len         : {p.get('header_len')}")
+        print(f"  total_len          : {p.get('total_len')}")
+        print(f"  data_object_count  : {p.get('data_object_child_count')}")
+        print(f"  unknown_header_hex : {p.get('unknown_header_hex')}")
+    return 0
+
+
 def cmd_search(args):
     data = _load(args.itunesdb)
     tracks = parse_all_tracks(data, log=print)
@@ -579,6 +706,10 @@ def build_parser():
     p_summary = sub.add_parser('summary', help="Scan the whole library and list every album with a Sort-field, Compilation, or Disc mismatch")
     p_summary.add_argument('itunesdb', help="Path to the iTunesDB file")
     p_summary.set_defaults(func=cmd_summary)
+
+    p_playlists = sub.add_parser('playlists', help="EXPERIMENTAL: dump raw playlist (mhyp) headers for byte-level comparison -- see README")
+    p_playlists.add_argument('itunesdb', help="Path to the iTunesDB file")
+    p_playlists.set_defaults(func=cmd_playlists)
 
     p_fix = sub.add_parser('fix', help="EXPERIMENTAL, not confirmed safe -- see README. Patches Compilation/Disc (a correlated symptom, not the confirmed cause) for named album(s), writing a new output file")
     p_fix.add_argument('itunesdb', help="Path to the iTunesDB file")
